@@ -126,7 +126,7 @@ async fn main() -> Result<()> {
 
 fn cmd_list() -> Result<()> {
     let resolvers = bundled_resolvers();
-    println!("{:<24} {:<14} {:<32} {}", "name", "provider", "ipv4", "ipv6");
+    println!("{:<24} {:<14} {:<32} ipv6", "name", "provider", "ipv4");
     for r in &resolvers {
         let v4 = r.ipv4.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",");
         let v6 = r.ipv6.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(",");
@@ -142,7 +142,7 @@ async fn cmd_probe(host: &str, rtt_timeout: Duration) -> Result<()> {
         "Probing {} resolvers for {} (UDP/53, A, timeout={:?})\n",
         resolvers.len(), host, rtt_timeout
     );
-    println!("{:<24} {:<16} {:>10}  {:<8} {}", "resolver", "addr", "rtt", "rcode", "answer");
+    println!("{:<24} {:<16} {:>10}  {:<8} answer", "resolver", "addr", "rtt", "rcode");
     println!("{}", "-".repeat(90));
 
     let mut handles = Vec::new();

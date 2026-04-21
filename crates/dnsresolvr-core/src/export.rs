@@ -113,8 +113,7 @@ fn write_json(reports: &[EndpointReport], path: &Path) -> io::Result<()> {
         endpoints: reports.iter().map(ExportedEndpoint::from).collect(),
     };
     let mut f = File::create(path)?;
-    serde_json::to_writer_pretty(&mut f, &exported)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    serde_json::to_writer_pretty(&mut f, &exported).map_err(io::Error::other)?;
     f.write_all(b"\n")?;
     Ok(())
 }

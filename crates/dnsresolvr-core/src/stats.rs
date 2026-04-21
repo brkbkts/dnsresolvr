@@ -81,7 +81,7 @@ mod tests {
 
     #[test]
     fn percentiles_on_100_samples() {
-        let rtts: Vec<Duration> = (1..=100).map(|n| d(n)).collect();
+        let rtts: Vec<Duration> = (1..=100).map(d).collect();
         let s = summarize(rtts, 100).unwrap();
         assert_eq!(s.min, d(1));
         assert_eq!(s.max, d(100));

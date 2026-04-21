@@ -425,14 +425,14 @@ fn execute_command(app: &mut App, cmd: &str, bench: Option<BenchProc>) -> Comman
     let rest: Vec<&str> = parts.collect();
 
     match head {
-        "q" | "quit" | "exit" => return CommandResult::Quit,
+        "q" | "quit" | "exit" => CommandResult::Quit,
         "w" | "write" | "export" => {
             write_export(app, rest.first().copied());
             CommandResult::Continue(bench)
         }
         "wq" => {
             write_export(app, rest.first().copied());
-            return CommandResult::Quit;
+            CommandResult::Quit
         }
         "r" | "run" | "start" | "restart" => {
             CommandResult::Continue(Some(restart(app, bench)))
@@ -472,7 +472,7 @@ fn execute_command(app: &mut App, cmd: &str, bench: Option<BenchProc>) -> Comman
             CommandResult::Continue(bench)
         }
         "domains" => {
-            app.set_status(format!("{}", app.cfg.domains.join(", ")), Color::White);
+            app.set_status(app.cfg.domains.join(", "), Color::White);
             CommandResult::Continue(bench)
         }
         "help" | "?" => { app.mode = Mode::Help; CommandResult::Continue(bench) }

@@ -182,20 +182,17 @@ pub fn build_endpoints(resolvers: &[Resolver], include_ipv6: bool) -> Vec<(Strin
 async fn run_class_streaming(
     id: usize,
     addr: IpAddr,
-    domains: &[String],
-    iterations: usize,
-    timeout: Duration,
-    inter_query: Duration,
+    cfg: &BenchConfig,
     class: Class,
     tx: &mpsc::UnboundedSender<BenchEvent>,
 ) {
-    for _ in 0..iterations {
-        for (idx, d) in domains.iter().enumerate() {
+    for _ in 0..cfg.iterations {
+        for (idx, d) in cfg.domains.iter().enumerate() {
             let host = match class {
                 Class::Cached => d.clone(),
                 Class::Uncached => format!("{}.{}", random_label(), d),
             };
-            let result = match probe_udp(addr, &host, RecordType::A, timeout).await {
+            let result = match probe_udp(addr, &host, RecordType::A, cfg.timeout).await {
                 Ok(o) => ProbeResult::Ok(o.rtt),
                 Err(crate::probe::ProbeError::Timeout(_)) => ProbeResult::Fail(FailKind::Timeout),
                 Err(crate::probe::ProbeError::Io(_)) => ProbeResult::Fail(FailKind::Network),
@@ -207,8 +204,8 @@ async fn run_class_streaming(
                 domain_idx: idx as u16,
                 result,
             });
-            if !inter_query.is_zero() {
-                sleep(inter_query).await;
+            if !cfg.inter_query.is_zero() {
+                sleep(cfg.inter_query).await;
             }
         }
     }
@@ -240,30 +237,10 @@ pub async fn run_bench_streaming(
         let tx = tx.clone();
         handles.push(tokio::spawn(async move {
             if cfg.cached {
-                run_class_streaming(
-                    id,
-                    addr,
-                    &cfg.domains,
-                    cfg.iterations,
-                    cfg.timeout,
-                    cfg.inter_query,
-                    Class::Cached,
-                    &tx,
-                )
-                .await;
+                run_class_streaming(id, addr, &cfg, Class::Cached, &tx).await;
             }
             if cfg.uncached {
-                run_class_streaming(
-                    id,
-                    addr,
-                    &cfg.domains,
-                    cfg.iterations,
-                    cfg.timeout,
-                    cfg.inter_query,
-                    Class::Uncached,
-                    &tx,
-                )
-                .await;
+                run_class_streaming(id, addr, &cfg, Class::Uncached, &tx).await;
             }
             let _ = tx.send(BenchEvent::Done { id });
         }));
