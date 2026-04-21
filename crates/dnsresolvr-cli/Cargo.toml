@@ -1,0 +1,20 @@
+[package]
+name = "dnsresolvr-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "CLI for dnsresolvr DNS benchmark"
+
+[[bin]]
+name = "dnsresolvr"
+path = "src/main.rs"
+
+[dependencies]
+dnsresolvr-core = { path = "../dnsresolvr-core" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+ratatui = "0.28"
+crossterm = { version = "0.28", features = ["event-stream"] }
+futures = "0.3"
