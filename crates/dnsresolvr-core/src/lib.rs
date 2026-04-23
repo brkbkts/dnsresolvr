@@ -6,6 +6,7 @@ pub mod export;
 pub mod probe;
 pub mod resolver;
 pub mod stats;
+pub mod transport;
 
 pub use bench::{
     build_endpoints, run_bench, run_bench_streaming, BenchConfig, BenchEvent, Class,
@@ -16,5 +17,6 @@ pub use export::{export, ExportFormat};
 pub use probe::{probe_udp, ProbeError, ProbeOutcome};
 pub use resolver::{bundled_resolvers, Resolver};
 pub use stats::{summarize, Summary};
+pub use transport::{probe, Transport, TransportKind};
 
 pub use hickory_proto::rr::RecordType;

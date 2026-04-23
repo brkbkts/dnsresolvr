@@ -12,7 +12,6 @@ pub const DEFAULT_DOMAINS: &[&str] = &[
     "steampowered.com",
     "battle.net",
     "leagueoflegends.com",
-    "epicgames.com",
     // social / chat
     "discord.com",
     "youtube.com",
@@ -20,7 +19,6 @@ pub const DEFAULT_DOMAINS: &[&str] = &[
     "google.com",
     "cloudflare.com",
     "github.com",
-    "wikipedia.org",
     "netflix.com",
     "amazon.com",
 ];

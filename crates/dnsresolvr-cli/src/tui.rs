@@ -1,7 +1,6 @@
 //! Live ratatui frontend with vim-style command mode.
 
 use std::io;
-use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +14,7 @@ use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScree
 use dnsresolvr_core::{
     bundled_resolvers, default_domains, export, run_bench_streaming, summarize, BenchConfig,
     BenchEvent, Class, EndpointReport, ExportFormat, FailKind, ProbeResult, Resolver, Summary,
+    TransportKind,
 };
 use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -110,7 +110,8 @@ impl DomainStats {
 struct EndpointState {
     name: String,
     provider: String,
-    addr: IpAddr,
+    transport_kind: TransportKind,
+    addr_display: String,
     cached: Vec<DomainStats>,
     uncached: Vec<DomainStats>,
     total_per_class: usize,
@@ -161,7 +162,8 @@ impl EndpointState {
         EndpointReport {
             resolver: self.name.clone(),
             provider: self.provider.clone(),
-            addr: self.addr,
+            transport_kind: self.transport_kind,
+            addr_display: self.addr_display.clone(),
             cached: self.cached_summary(),
             uncached: self.uncached_summary(),
         }
@@ -190,13 +192,21 @@ struct App {
 impl App {
     fn apply(&mut self, ev: BenchEvent) {
         match ev {
-            BenchEvent::Start { id, resolver, provider, addr, total_per_class } => {
+            BenchEvent::Start {
+                id,
+                resolver,
+                provider,
+                transport_kind,
+                addr_display,
+                total_per_class,
+            } => {
                 if self.endpoints.len() <= id {
                     let n_domains = self.cfg.domains.len();
                     self.endpoints.resize_with(id + 1, || EndpointState {
                         name: String::new(),
                         provider: String::new(),
-                        addr: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        transport_kind: TransportKind::Udp,
+                        addr_display: String::new(),
                         cached: vec![DomainStats::default(); n_domains],
                         uncached: vec![DomainStats::default(); n_domains],
                         total_per_class: 0,
@@ -206,7 +216,8 @@ impl App {
                 let e = &mut self.endpoints[id];
                 e.name = resolver;
                 e.provider = provider;
-                e.addr = addr;
+                e.transport_kind = transport_kind;
+                e.addr_display = addr_display;
                 e.total_per_class = total_per_class;
             }
             BenchEvent::Probe { id, class, domain_idx, result } => {
@@ -551,6 +562,29 @@ fn apply_set(app: &mut App, args: &[&str]) {
                 None => app.set_status("uncached: on | off | toggle", Color::Red),
             }
         }
+        "transport" | "transports" => {
+            if val.eq_ignore_ascii_case("all") || val.is_empty() {
+                app.cfg.transports.clear();
+                app.set_status("transports: all (:r to apply)", Color::Cyan);
+                return;
+            }
+            let mut kinds = Vec::new();
+            let mut bad = Vec::new();
+            for tok in val.split([',', ' ']) {
+                if tok.is_empty() { continue; }
+                match TransportKind::parse(tok) {
+                    Some(k) => if !kinds.contains(&k) { kinds.push(k); }
+                    None => bad.push(tok.to_string()),
+                }
+            }
+            if !bad.is_empty() {
+                app.set_status(format!("unknown transport: {}", bad.join(", ")), Color::Red);
+                return;
+            }
+            app.cfg.transports = kinds.clone();
+            let labels: Vec<&str> = kinds.iter().map(|k| k.label()).collect();
+            app.set_status(format!("transports = {} (:r to apply)", labels.join(",")), Color::Cyan);
+        }
         _ => app.set_status(format!("unknown setting: {}", key), Color::Red),
     }
 }
@@ -648,30 +682,31 @@ fn draw_status_line(f: &mut Frame, area: Rect, app: &App) {
         _ => "none",
     };
     let stack = if cfg.include_ipv6 { "v4+v6" } else { "v4" };
-    let base = Line::from(vec![
-        Span::styled(" cfg ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-        Span::raw(format!(
-            "  iter:{} sp:{}ms to:{}ms {} {} domains:{} sort:{}",
-            cfg.iterations,
-            cfg.inter_query.as_millis(),
-            cfg.timeout.as_millis(),
-            classes, stack, cfg.domains.len(),
-            app.sort.label(),
-        )),
-    ]);
+    let transports = if cfg.transports.is_empty() {
+        "udp+dot+doh".to_string()
+    } else {
+        cfg.transports.iter().map(|k| k.label().to_ascii_lowercase()).collect::<Vec<_>>().join("+")
+    };
+    let summary = format!(
+        "  iter:{} sp:{}ms to:{}ms {} {} t:{} domains:{}",
+        cfg.iterations,
+        cfg.inter_query.as_millis(),
+        cfg.timeout.as_millis(),
+        classes, stack, transports, cfg.domains.len(),
+    );
 
     if let Some(s) = &app.status {
         let combined = Line::from(vec![
             Span::styled(" cfg ", Style::default().bg(Color::DarkGray).fg(Color::White)),
-            Span::raw(format!(
-                "  iter:{} sp:{}ms to:{}ms {} {} domains:{}  ·  ",
-                cfg.iterations, cfg.inter_query.as_millis(), cfg.timeout.as_millis(),
-                classes, stack, cfg.domains.len(),
-            )),
+            Span::raw(format!("{}  ·  ", summary)),
             Span::styled(s.text.clone(), Style::default().fg(s.color).add_modifier(Modifier::BOLD)),
         ]);
         f.render_widget(Paragraph::new(combined), area);
     } else {
+        let base = Line::from(vec![
+            Span::styled(" cfg ", Style::default().bg(Color::DarkGray).fg(Color::White)),
+            Span::raw(format!("{} sort:{}", summary, app.sort.label())),
+        ]);
         f.render_widget(Paragraph::new(base), area);
     }
 }
@@ -719,9 +754,14 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     let mut header_cells = vec![
         Cell::from("resolver").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("t").style(Style::default().add_modifier(Modifier::BOLD)),
         Cell::from("addr").style(Style::default().add_modifier(Modifier::BOLD)),
     ];
-    let mut widths: Vec<Constraint> = vec![Constraint::Length(22), Constraint::Length(20)];
+    let mut widths: Vec<Constraint> = vec![
+        Constraint::Length(22),
+        Constraint::Length(3),
+        Constraint::Length(32),
+    ];
     if app.cfg.cached {
         for h in ["c_p50", "c_p95", "c_p99", "c_rel"] {
             header_cells.push(Cell::from(h).style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)));
@@ -740,9 +780,11 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
     let mut rows: Vec<Row> = Vec::new();
     for &i in &app.last_sorted {
         let e = &app.endpoints[i];
+        let tcolor = transport_color(e.transport_kind);
         let mut cells = vec![
             Cell::from(truncate(&e.name, 22)),
-            Cell::from(e.addr.to_string()),
+            Cell::from(e.transport_kind.label()).style(Style::default().fg(tcolor).add_modifier(Modifier::BOLD)),
+            Cell::from(truncate(&e.addr_display, 32)),
         ];
         if app.cfg.cached {
             push_summary_cells(&mut cells, e.cached_summary(), Color::LightGreen);
@@ -803,11 +845,13 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
 
     let cached = ep.cached_summary();
     let uncached = ep.uncached_summary();
+    let tcolor = transport_color(ep.transport_kind);
     let summary_lines = vec![
         Line::from(vec![
             Span::styled(format!("{} ", ep.name), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(format!("({}) ", ep.provider), Style::default().fg(Color::DarkGray)),
-            Span::raw(ep.addr.to_string()),
+            Span::styled(format!("{} ", ep.transport_kind.label()), Style::default().fg(tcolor).add_modifier(Modifier::BOLD)),
+            Span::raw(ep.addr_display.clone()),
         ]),
         class_line("cached", &cached, Color::LightGreen),
         class_line("uncached", &uncached, Color::LightMagenta),
@@ -908,6 +952,7 @@ fn draw_help_overlay(f: &mut Frame, _app: &App) {
         Line::from("  :set to <ms>               per-query timeout"),
         Line::from("  :set preset <q|s|t|e>      quick | standard | thorough | exhaustive"),
         Line::from("  :set ipv6 on|off|toggle    include IPv6 endpoints"),
+        Line::from("  :set transports <list>     udp | dot | doh | all (comma-separated)"),
         Line::from("  :set cached on|off         include cached class (alias :cached)"),
         Line::from("  :set uncached on|off       include uncached class (alias :uncached)"),
         Line::from("  :add <domain> [..]         add domains to probe set"),
@@ -952,6 +997,14 @@ fn fmt_opt_ms(ms: Option<f64>) -> String {
     match ms {
         Some(v) => format!("{:>7.1}ms", v),
         None => "       —".to_string(),
+    }
+}
+
+fn transport_color(k: TransportKind) -> Color {
+    match k {
+        TransportKind::Udp => Color::White,
+        TransportKind::Dot => Color::LightBlue,
+        TransportKind::Doh => Color::LightYellow,
     }
 }
 
