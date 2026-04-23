@@ -61,6 +61,7 @@ impl From<&Summary> for ExportedSummary {
 struct ExportedEndpoint {
     resolver: String,
     provider: String,
+    transport: &'static str,
     addr: String,
     cached: Option<ExportedSummary>,
     uncached: Option<ExportedSummary>,
@@ -71,7 +72,8 @@ impl From<&EndpointReport> for ExportedEndpoint {
         Self {
             resolver: e.resolver.clone(),
             provider: e.provider.clone(),
-            addr: e.addr.to_string(),
+            transport: e.transport_kind.label(),
+            addr: e.addr_display.clone(),
             cached: e.cached.as_ref().map(ExportedSummary::from),
             uncached: e.uncached.as_ref().map(ExportedSummary::from),
         }
@@ -122,17 +124,18 @@ fn write_csv(reports: &[EndpointReport], path: &Path) -> io::Result<()> {
     let mut f = File::create(path)?;
     writeln!(
         f,
-        "resolver,provider,addr,\
+        "resolver,provider,transport,addr,\
          c_count,c_total,c_rel,c_min_ms,c_p50_ms,c_p95_ms,c_p99_ms,c_max_ms,c_mean_ms,c_stddev_ms,\
          u_count,u_total,u_rel,u_min_ms,u_p50_ms,u_p95_ms,u_p99_ms,u_max_ms,u_mean_ms,u_stddev_ms"
     )?;
     for e in reports {
         write!(
             f,
-            "{},{},{}",
+            "{},{},{},{}",
             csv_escape(&e.resolver),
             csv_escape(&e.provider),
-            e.addr
+            e.transport_kind.label(),
+            csv_escape(&e.addr_display),
         )?;
         write_class(&mut f, e.cached.as_ref())?;
         write_class(&mut f, e.uncached.as_ref())?;

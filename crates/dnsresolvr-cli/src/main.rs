@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 use dnsresolvr_core::{
     bundled_resolvers, dedup_preserve, default_domains, export, load_domains_file, probe_udp,
-    run_bench, BenchConfig, EndpointReport, ExportFormat, RecordType, Summary,
+    run_bench, BenchConfig, EndpointReport, ExportFormat, RecordType, Summary, TransportKind,
 };
 
 mod tui;
@@ -29,7 +29,7 @@ struct Cli {
 pub enum Preset {
     /// 1 iteration per domain — smoke test
     Quick,
-    /// 5 iterations per domain — default
+    /// 4 iterations per domain — default
     Standard,
     /// 20 iterations per domain — tighter tail stats
     Thorough,
@@ -41,7 +41,7 @@ impl Preset {
     pub fn iterations(self) -> usize {
         match self {
             Preset::Quick => 1,
-            Preset::Standard => 5,
+            Preset::Standard => 4,
             Preset::Thorough => 20,
             Preset::Exhaustive => 50,
         }
@@ -77,13 +77,13 @@ enum Cmd {
 #[derive(clap::Args, Debug, Clone)]
 pub struct BenchArgs {
     /// Iterations per domain per class. Ignored if --preset is set.
-    #[arg(long, default_value_t = 5)]
+    #[arg(long, default_value_t = 4)]
     iterations: usize,
     #[arg(long, value_enum)]
     preset: Option<Preset>,
     #[arg(long, default_value_t = 1500)]
     timeout_ms: u64,
-    #[arg(long, default_value_t = 25)]
+    #[arg(long, default_value_t = 40)]
     spacing_ms: u64,
     /// Skip the cached class (warm-cache probing).
     #[arg(long)]
@@ -93,6 +93,9 @@ pub struct BenchArgs {
     no_uncached: bool,
     #[arg(long)]
     ipv6: bool,
+    /// Restrict to specific transports (comma-separated). Options: udp, dot, doh. Default: all.
+    #[arg(long, value_name = "LIST")]
+    transports: Option<String>,
     #[arg(long = "add-domain", value_name = "DOMAIN")]
     add_domains: Vec<String>,
     #[arg(long, value_name = "PATH")]
@@ -214,6 +217,23 @@ pub fn build_bench_config(args: &BenchArgs) -> Result<BenchConfig> {
 
     let iterations = args.preset.map(Preset::iterations).unwrap_or(args.iterations);
 
+    let transports = match &args.transports {
+        None => Vec::new(),
+        Some(s) if s.eq_ignore_ascii_case("all") => Vec::new(),
+        Some(s) => {
+            let mut kinds = Vec::new();
+            for tok in s.split([',', ' ']) {
+                if tok.is_empty() { continue; }
+                match TransportKind::parse(tok) {
+                    Some(k) if !kinds.contains(&k) => kinds.push(k),
+                    Some(_) => {}
+                    None => anyhow::bail!("unknown transport: {} (expected udp, dot, doh, or all)", tok),
+                }
+            }
+            kinds
+        }
+    };
+
     Ok(BenchConfig {
         domains,
         iterations,
@@ -221,7 +241,9 @@ pub fn build_bench_config(args: &BenchArgs) -> Result<BenchConfig> {
         cached,
         uncached,
         include_ipv6: args.ipv6,
+        transports,
         inter_query: Duration::from_millis(args.spacing_ms),
+        ..BenchConfig::default()
     })
 }
 
@@ -269,14 +291,23 @@ fn print_bench_table(reports: &[EndpointReport], cached: bool, uncached: bool) {
         }
     };
 
-    print!("{:<22} {:<16} ", "resolver", "addr");
+    print!("{:<22} {:<4} {:<30} ", "resolver", "t", "addr");
     if cached { print!("{:>7} {:>7} {:>7} {:>5} ", "c_p50", "c_p95", "c_p99", "c_rel"); }
     if uncached { print!("{:>7} {:>7} {:>7} {:>5} ", "u_p50", "u_p95", "u_p99", "u_rel"); }
     println!();
-    println!("{}", "-".repeat(22 + 1 + 16 + 1 + if cached { 31 } else { 0 } + if uncached { 31 } else { 0 }));
+    let base_width = 22 + 1 + 4 + 1 + 30 + 1;
+    println!(
+        "{}",
+        "-".repeat(base_width + if cached { 31 } else { 0 } + if uncached { 31 } else { 0 })
+    );
 
     for ep in reports {
-        print!("{:<22} {:<16} ", truncate(&ep.resolver, 22), ep.addr.to_string());
+        print!(
+            "{:<22} {:<4} {:<30} ",
+            truncate(&ep.resolver, 22),
+            ep.transport_kind.label(),
+            truncate(&ep.addr_display, 30),
+        );
         if cached {
             let (a, b, c, r) = col(&ep.cached);
             print!("{:>6}ms {:>6}ms {:>6}ms {:>5} ", a, b, c, r);

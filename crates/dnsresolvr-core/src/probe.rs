@@ -36,7 +36,7 @@ pub struct ProbeOutcome {
 
 static ID_COUNTER: AtomicU16 = AtomicU16::new(1);
 
-fn next_id() -> u16 {
+pub(crate) fn next_id() -> u16 {
     // wrap around at 0 to avoid a 0 id which some resolvers treat oddly
     let v = ID_COUNTER.fetch_add(1, Ordering::Relaxed);
     if v == 0 {
