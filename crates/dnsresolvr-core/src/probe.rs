@@ -4,8 +4,7 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
 use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
-use hickory_proto::rr::{Name, RecordType};
-use hickory_proto::serialize::binary::{BinDecodable, BinEncodable};
+use hickory_proto::rr::{Name, RData, RecordType};
 use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -32,6 +31,8 @@ pub struct ProbeOutcome {
     pub rcode: ResponseCode,
     pub answer_count: usize,
     pub first_answer: Option<String>,
+    /// Record data of every answer, as text (TXT strings are unquoted).
+    pub answers: Vec<String>,
 }
 
 static ID_COUNTER: AtomicU16 = AtomicU16::new(1);
@@ -46,6 +47,43 @@ pub(crate) fn next_id() -> u16 {
     }
 }
 
+/// Encode a recursive query for `hostname` with the given transaction id.
+pub(crate) fn build_query(hostname: &str, qtype: RecordType, id: u16) -> Result<Vec<u8>, ProbeError> {
+    let name = Name::from_str(hostname).map_err(|e| ProbeError::BadName(e.to_string()))?;
+    let mut msg = Message::new(id, MessageType::Query, OpCode::Query);
+    msg.metadata.recursion_desired = true;
+    msg.add_query(Query::query(name, qtype));
+    msg.to_vec().map_err(|e| ProbeError::Encode(e.to_string()))
+}
+
+/// Parse a wire-format response and check it answers the query we sent.
+pub(crate) fn decode_response(
+    bytes: &[u8],
+    expected_id: u16,
+    rtt: Duration,
+) -> Result<ProbeOutcome, ProbeError> {
+    let resp = Message::from_vec(bytes).map_err(|e| ProbeError::Decode(e.to_string()))?;
+    if resp.metadata.id != expected_id {
+        return Err(ProbeError::IdMismatch { sent: expected_id, got: resp.metadata.id });
+    }
+    let first_answer = resp.answers.first().map(|r| r.to_string());
+    let answers = resp
+        .answers
+        .iter()
+        .map(|r| match &r.data {
+            RData::TXT(txt) => txt.txt_data.iter().map(|part| String::from_utf8_lossy(part)).collect(),
+            other => other.to_string(),
+        })
+        .collect();
+    Ok(ProbeOutcome {
+        rtt,
+        rcode: resp.metadata.response_code,
+        answer_count: resp.answers.len(),
+        first_answer,
+        answers,
+    })
+}
+
 /// Send one UDP/53 DNS query to `resolver` for `hostname` and time the round trip.
 ///
 /// No retries, no caching, no fallback. Higher layers build policy on top
@@ -56,17 +94,18 @@ pub async fn probe_udp(
     qtype: RecordType,
     rtt_timeout: Duration,
 ) -> Result<ProbeOutcome, ProbeError> {
-    let name = Name::from_str(hostname).map_err(|e| ProbeError::BadName(e.to_string()))?;
+    probe_udp_at(SocketAddr::new(resolver, 53), hostname, qtype, rtt_timeout).await
+}
 
+/// Same as [`probe_udp`] but for a resolver on a non-standard port.
+pub async fn probe_udp_at(
+    resolver: SocketAddr,
+    hostname: &str,
+    qtype: RecordType,
+    rtt_timeout: Duration,
+) -> Result<ProbeOutcome, ProbeError> {
     let id = next_id();
-    let mut msg = Message::new();
-    msg.set_id(id)
-        .set_message_type(MessageType::Query)
-        .set_op_code(OpCode::Query)
-        .set_recursion_desired(true)
-        .add_query(Query::query(name, qtype));
-
-    let bytes = msg.to_bytes().map_err(|e| ProbeError::Encode(e.to_string()))?;
+    let bytes = build_query(hostname, qtype, id)?;
 
     let bind_addr: SocketAddr = if resolver.is_ipv4() {
         "0.0.0.0:0".parse().unwrap()
@@ -74,7 +113,7 @@ pub async fn probe_udp(
         "[::]:0".parse().unwrap()
     };
     let sock = UdpSocket::bind(bind_addr).await?;
-    sock.connect(SocketAddr::new(resolver, 53)).await?;
+    sock.connect(resolver).await?;
 
     let start = Instant::now();
     sock.send(&bytes).await?;
@@ -85,16 +124,5 @@ pub async fn probe_udp(
         .map_err(|_| ProbeError::Timeout(rtt_timeout))??;
     let rtt = start.elapsed();
 
-    let resp = Message::from_bytes(&buf[..recv]).map_err(|e| ProbeError::Decode(e.to_string()))?;
-    if resp.id() != id {
-        return Err(ProbeError::IdMismatch { sent: id, got: resp.id() });
-    }
-
-    let first_answer = resp.answers().first().map(|r| r.to_string());
-    Ok(ProbeOutcome {
-        rtt,
-        rcode: resp.response_code(),
-        answer_count: resp.answers().len(),
-        first_answer,
-    })
+    decode_response(&buf[..recv], id, rtt)
 }

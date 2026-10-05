@@ -1,6 +1,7 @@
 //! Live ratatui frontend with vim-style command mode.
 
 use std::io;
+use std::net::IpAddr;
 use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -12,11 +13,11 @@ use crossterm::event::{
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
 use dnsresolvr_core::{
-    bundled_resolvers, default_domains, export, run_bench_streaming, summarize, BenchConfig,
-    BenchEvent, Class, EndpointReport, ExportFormat, FailKind, ProbeResult, Resolver, Summary,
+    default_domains, export, run_bench_streaming, summarize, verdict, BenchConfig, BenchEvent,
+    Class, EndpointReport, ExportFormat, FailKind, PrivacyInfo, ProbeResult, Resolver, Summary,
     TransportKind,
 };
-use futures::StreamExt;
+use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -26,14 +27,23 @@ use ratatui::{Frame, Terminal};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::Preset;
+use crate::{class_cells, dnssec_label, ecs_label, truncate, Preset};
 
 pub struct TuiOpts {
     pub cfg: BenchConfig,
+    pub resolvers: Vec<Resolver>,
+    /// The machine's own DNS servers, for the "your resolver" verdict line.
+    pub system: Vec<IpAddr>,
     pub export_path: Option<PathBuf>,
 }
 
-pub async fn run(opts: TuiOpts) -> Result<()> {
+/// What was on screen when the user quit, so the caller can print it.
+pub struct TuiOutcome {
+    pub reports: Vec<EndpointReport>,
+    pub cfg: BenchConfig,
+}
+
+pub async fn run(opts: TuiOpts) -> Result<TuiOutcome> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -51,13 +61,14 @@ pub async fn run(opts: TuiOpts) -> Result<()> {
 // --- sort / mode ---
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SortKey { CachedP50, UncachedP50, Reliability, Name }
+enum SortKey { CachedP50, UncachedP50, Setup, Reliability, Name }
 
 impl SortKey {
     fn next(self) -> Self {
         match self {
             SortKey::CachedP50 => SortKey::UncachedP50,
-            SortKey::UncachedP50 => SortKey::Reliability,
+            SortKey::UncachedP50 => SortKey::Setup,
+            SortKey::Setup => SortKey::Reliability,
             SortKey::Reliability => SortKey::Name,
             SortKey::Name => SortKey::CachedP50,
         }
@@ -66,6 +77,7 @@ impl SortKey {
         match self {
             SortKey::CachedP50 => "cached p50",
             SortKey::UncachedP50 => "uncached p50",
+            SortKey::Setup => "connection setup",
             SortKey::Reliability => "reliability",
             SortKey::Name => "name",
         }
@@ -77,20 +89,22 @@ enum Mode {
     Normal,
     Command { input: String },
     Help,
+    Verdict,
 }
 
 // --- per-endpoint state ---
 
 #[derive(Default, Debug, Clone)]
-struct FailCounts { timeout: usize, network: usize, protocol: usize }
+struct FailCounts { timeout: usize, network: usize, protocol: usize, bad_answer: usize }
 
 impl FailCounts {
-    fn total(&self) -> usize { self.timeout + self.network + self.protocol }
+    fn total(&self) -> usize { self.timeout + self.network + self.protocol + self.bad_answer }
     fn bump(&mut self, k: FailKind) {
         match k {
             FailKind::Timeout => self.timeout += 1,
             FailKind::Network => self.network += 1,
             FailKind::Protocol => self.protocol += 1,
+            FailKind::BadAnswer => self.bad_answer += 1,
         }
     }
 }
@@ -110,17 +124,54 @@ impl DomainStats {
 struct EndpointState {
     name: String,
     provider: String,
+    filtering: Option<String>,
     transport_kind: TransportKind,
     addr_display: String,
     cached: Vec<DomainStats>,
     uncached: Vec<DomainStats>,
     total_per_class: usize,
+    /// Got a concurrency slot; until then the row shows as queued.
+    running: bool,
     done: bool,
+    /// `None` until measured, `Some(None)` if the connection failed.
+    setup: Option<Option<Duration>>,
+    dnssec: Option<bool>,
+    privacy: Option<PrivacyInfo>,
+    /// Summaries are rebuilt once per frame, not on every probe or comparison.
+    cached_sum: Option<Summary>,
+    uncached_sum: Option<Summary>,
+    dirty: bool,
 }
 
 impl EndpointState {
-    fn cached_summary(&self) -> Option<Summary> { Self::summarize_class(&self.cached) }
-    fn uncached_summary(&self) -> Option<Summary> { Self::summarize_class(&self.uncached) }
+    fn new(n_domains: usize) -> Self {
+        Self {
+            name: String::new(),
+            provider: String::new(),
+            filtering: None,
+            transport_kind: TransportKind::Udp,
+            addr_display: String::new(),
+            cached: vec![DomainStats::default(); n_domains],
+            uncached: vec![DomainStats::default(); n_domains],
+            total_per_class: 0,
+            running: false,
+            done: false,
+            setup: None,
+            dnssec: None,
+            privacy: None,
+            cached_sum: None,
+            uncached_sum: None,
+            dirty: false,
+        }
+    }
+
+    fn refresh(&mut self) {
+        if self.dirty {
+            self.cached_sum = Self::summarize_class(&self.cached);
+            self.uncached_sum = Self::summarize_class(&self.uncached);
+            self.dirty = false;
+        }
+    }
     fn summarize_class(per_domain: &[DomainStats]) -> Option<Summary> {
         let mut rtts = Vec::new();
         let mut total = 0usize;
@@ -128,13 +179,10 @@ impl EndpointState {
             rtts.extend(d.rtts.iter().copied());
             total += d.total();
         }
-        if total == 0 { return None; }
         summarize(rtts, total)
     }
     fn combined_reliability(&self) -> Option<f64> {
-        let s = self.cached_summary();
-        let c = self.uncached_summary();
-        match (s, c) {
+        match (&self.cached_sum, &self.uncached_sum) {
             (None, None) => None,
             (Some(a), None) | (None, Some(a)) => Some(a.reliability()),
             (Some(a), Some(b)) => {
@@ -142,6 +190,9 @@ impl EndpointState {
                 if total == 0 { None } else { Some((a.successes + b.successes) as f64 / total as f64) }
             }
         }
+    }
+    fn setup_time(&self) -> Option<Duration> {
+        self.setup.flatten()
     }
     fn progress(&self, cached_enabled: bool, uncached_enabled: bool) -> (usize, usize) {
         let total = self.total_per_class * (cached_enabled as usize + uncached_enabled as usize);
@@ -155,6 +206,7 @@ impl EndpointState {
             f.timeout += d.fails.timeout;
             f.network += d.fails.network;
             f.protocol += d.fails.protocol;
+            f.bad_answer += d.fails.bad_answer;
         }
         f
     }
@@ -162,10 +214,14 @@ impl EndpointState {
         EndpointReport {
             resolver: self.name.clone(),
             provider: self.provider.clone(),
+            filtering: self.filtering.clone(),
             transport_kind: self.transport_kind,
             addr_display: self.addr_display.clone(),
-            cached: self.cached_summary(),
-            uncached: self.uncached_summary(),
+            setup: self.setup_time(),
+            dnssec: self.dnssec,
+            privacy: self.privacy.clone(),
+            cached: Self::summarize_class(&self.cached),
+            uncached: Self::summarize_class(&self.uncached),
         }
     }
 }
@@ -176,6 +232,7 @@ struct StatusMsg { text: String, color: Color, shown_since: Instant }
 
 struct App {
     resolvers: Vec<Resolver>,
+    system: Vec<IpAddr>,
     cfg: BenchConfig,
     endpoints: Vec<EndpointState>,
     sort: SortKey,
@@ -196,29 +253,34 @@ impl App {
                 id,
                 resolver,
                 provider,
+                filtering,
                 transport_kind,
                 addr_display,
                 total_per_class,
             } => {
                 if self.endpoints.len() <= id {
                     let n_domains = self.cfg.domains.len();
-                    self.endpoints.resize_with(id + 1, || EndpointState {
-                        name: String::new(),
-                        provider: String::new(),
-                        transport_kind: TransportKind::Udp,
-                        addr_display: String::new(),
-                        cached: vec![DomainStats::default(); n_domains],
-                        uncached: vec![DomainStats::default(); n_domains],
-                        total_per_class: 0,
-                        done: false,
-                    });
+                    self.endpoints.resize_with(id + 1, || EndpointState::new(n_domains));
                 }
                 let e = &mut self.endpoints[id];
                 e.name = resolver;
                 e.provider = provider;
+                e.filtering = filtering;
                 e.transport_kind = transport_kind;
                 e.addr_display = addr_display;
                 e.total_per_class = total_per_class;
+            }
+            BenchEvent::Running { id } => {
+                if let Some(e) = self.endpoints.get_mut(id) { e.running = true; }
+            }
+            BenchEvent::Setup { id, result } => {
+                if let Some(e) = self.endpoints.get_mut(id) { e.setup = Some(result); }
+            }
+            BenchEvent::Dnssec { id, validates } => {
+                if let Some(e) = self.endpoints.get_mut(id) { e.dnssec = validates; }
+            }
+            BenchEvent::Privacy { id, info } => {
+                if let Some(e) = self.endpoints.get_mut(id) { e.privacy = Some(info); }
             }
             BenchEvent::Probe { id, class, domain_idx, result } => {
                 if let Some(e) = self.endpoints.get_mut(id) {
@@ -231,13 +293,24 @@ impl App {
                             ProbeResult::Ok(rtt) => slot.rtts.push(rtt),
                             ProbeResult::Fail(k) => slot.fails.bump(k),
                         }
+                        e.dirty = true;
                     }
                 }
             }
             BenchEvent::Done { id } => {
                 if let Some(e) = self.endpoints.get_mut(id) { e.done = true; }
             }
-            BenchEvent::AllDone => self.finished = true,
+            BenchEvent::AllDone => {
+                self.finished = true;
+                self.set_status("done — press v for the verdict", Color::Green);
+            }
+        }
+    }
+
+    /// Rebuild stale summaries. Call once before sorting and drawing.
+    fn refresh(&mut self) {
+        for e in &mut self.endpoints {
+            e.refresh();
         }
     }
 
@@ -248,8 +321,11 @@ impl App {
             let eb = &self.endpoints[b];
             match self.sort {
                 SortKey::Name => ea.name.cmp(&eb.name),
-                SortKey::CachedP50 => key_p50(ea.cached_summary()).cmp(&key_p50(eb.cached_summary())),
-                SortKey::UncachedP50 => key_p50(ea.uncached_summary()).cmp(&key_p50(eb.uncached_summary())),
+                SortKey::CachedP50 => key_p50(&ea.cached_sum).cmp(&key_p50(&eb.cached_sum)),
+                SortKey::UncachedP50 => key_p50(&ea.uncached_sum).cmp(&key_p50(&eb.uncached_sum)),
+                SortKey::Setup => {
+                    ea.setup_time().unwrap_or(Duration::MAX).cmp(&eb.setup_time().unwrap_or(Duration::MAX))
+                }
                 SortKey::Reliability => {
                     ((eb.combined_reliability().unwrap_or(-1.0) * 1e9) as i64)
                         .cmp(&((ea.combined_reliability().unwrap_or(-1.0) * 1e9) as i64))
@@ -286,6 +362,12 @@ impl App {
         self.table_state.select(Some(next as usize));
     }
 
+    fn outcome(&self) -> TuiOutcome {
+        let mut reports: Vec<EndpointReport> = self.endpoints.iter().map(|e| e.to_report()).collect();
+        reports.sort_by_key(EndpointReport::score);
+        TuiOutcome { reports, cfg: self.cfg.clone() }
+    }
+
     fn set_status(&mut self, text: impl Into<String>, color: Color) {
         self.status = Some(StatusMsg {
             text: text.into(),
@@ -295,8 +377,11 @@ impl App {
     }
 }
 
-fn key_p50(s: Option<Summary>) -> u64 {
-    s.map(|s| s.p50.as_micros() as u64).unwrap_or(u64::MAX)
+fn key_p50(s: &Option<Summary>) -> u64 {
+    s.as_ref()
+        .filter(|s| s.has_samples())
+        .map(|s| s.p50.as_micros() as u64)
+        .unwrap_or(u64::MAX)
 }
 
 // --- bench lifecycle ---
@@ -314,14 +399,14 @@ fn spawn_bench(resolvers: Vec<Resolver>, cfg: BenchConfig) -> BenchProc {
     BenchProc { rx, handle }
 }
 
-async fn run_app<B: ratatui::backend::Backend>(
-    terminal: &mut Terminal<B>,
+async fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     opts: TuiOpts,
-) -> Result<()> {
-    let TuiOpts { cfg, export_path } = opts;
-    let resolvers = bundled_resolvers();
+) -> Result<TuiOutcome> {
+    let TuiOpts { cfg, resolvers, system, export_path } = opts;
     let mut app = App {
         resolvers: resolvers.clone(),
+        system,
         cfg,
         endpoints: Vec::new(),
         sort: SortKey::CachedP50,
@@ -343,13 +428,20 @@ async fn run_app<B: ratatui::backend::Backend>(
     let mut key_events = EventStream::new();
     let mut tick = tokio::time::interval(Duration::from_millis(120));
 
+    // Probe events only update state; the screen is redrawn on the tick or
+    // after a key press, so a burst of results costs one frame, not hundreds.
+    let mut redraw = true;
     loop {
         // clear stale status after 4 seconds
         if let Some(s) = &app.status {
             if s.shown_since.elapsed() > Duration::from_secs(4) { app.status = None; }
         }
-        app.last_sorted = app.sorted_indices();
-        terminal.draw(|f| draw(f, &mut app))?;
+        if redraw {
+            app.refresh();
+            app.last_sorted = app.sorted_indices();
+            terminal.draw(|f| draw(f, &mut app))?;
+            redraw = false;
+        }
 
         tokio::select! {
             maybe_ev = async {
@@ -359,11 +451,20 @@ async fn run_app<B: ratatui::backend::Backend>(
                 }
             } => {
                 match maybe_ev {
-                    Some(ev) => app.apply(ev),
-                    None => bench = None,
+                    Some(ev) => {
+                        app.apply(ev);
+                        if let Some(b) = bench.as_mut() {
+                            while let Ok(ev) = b.rx.try_recv() { app.apply(ev); }
+                        }
+                    }
+                    None => {
+                        bench = None;
+                        redraw = true;
+                    }
                 }
             }
             maybe_key = key_events.next() => {
+                redraw = true;
                 let Some(Ok(CtEvent::Key(k))) = maybe_key else { continue; };
                 if k.kind == KeyEventKind::Release { continue; }
 
@@ -373,7 +474,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                             KeyCode::Char(':') => app.mode = Mode::Command { input: String::new() },
                             KeyCode::Char('q') if k.modifiers == KeyModifiers::NONE => {
                                 maybe_export(&app, &app.export_path.clone());
-                                return Ok(());
+                                return Ok(app.outcome());
                             }
                             KeyCode::Esc => { app.detail_open = false; }
                             KeyCode::Char('s') => app.sort = app.sort.next(),
@@ -386,6 +487,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                 bench = Some(restart(&mut app, bench.take()));
                             }
                             KeyCode::Char('?') => app.mode = Mode::Help,
+                            KeyCode::Char('v') => app.mode = Mode::Verdict,
                             _ => {}
                         }
                     }
@@ -399,7 +501,7 @@ async fn run_app<B: ratatui::backend::Backend>(
                                     CommandResult::Continue(b) => bench = b,
                                     CommandResult::Quit => {
                                         maybe_export(&app, &app.export_path.clone());
-                                        return Ok(());
+                                        return Ok(app.outcome());
                                     }
                                 }
                             }
@@ -408,14 +510,17 @@ async fn run_app<B: ratatui::backend::Backend>(
                             _ => {}
                         }
                     }
-                    Mode::Help => {
-                        if matches!(k.code, KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Enter) {
+                    Mode::Help | Mode::Verdict => {
+                        if matches!(
+                            k.code,
+                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?') | KeyCode::Char('v') | KeyCode::Enter
+                        ) {
                             app.mode = Mode::Normal;
                         }
                     }
                 }
             }
-            _ = tick.tick() => {}
+            _ = tick.tick() => redraw = true,
         }
     }
 }
@@ -487,6 +592,7 @@ fn execute_command(app: &mut App, cmd: &str, bench: Option<BenchProc>) -> Comman
             CommandResult::Continue(bench)
         }
         "help" | "?" => { app.mode = Mode::Help; CommandResult::Continue(bench) }
+        "verdict" | "v" => { app.mode = Mode::Verdict; CommandResult::Continue(bench) }
         other => {
             app.set_status(format!("unknown command: {}", other), Color::Red);
             CommandResult::Continue(bench)
@@ -562,6 +668,49 @@ fn apply_set(app: &mut App, args: &[&str]) {
                 None => app.set_status("uncached: on | off | toggle", Color::Red),
             }
         }
+        "cc" | "concurrency" => {
+            match val.parse::<usize>() {
+                Ok(n) => {
+                    app.cfg.max_concurrent = n;
+                    let shown = if n == 0 { "unlimited".to_string() } else { n.to_string() };
+                    app.set_status(format!("concurrency = {} (:r to apply)", shown), Color::Cyan);
+                }
+                _ => app.set_status("concurrency: expected non-negative integer (0 = no limit)", Color::Red),
+            }
+        }
+        "warmup" => {
+            match parse_bool(val, app.cfg.warmup) {
+                Some(v) => { app.cfg.warmup = v; app.set_status(format!("warmup = {} (:r to apply)", v), Color::Cyan); }
+                None => app.set_status("warmup: on | off | toggle", Color::Red),
+            }
+        }
+        "privacy" => {
+            match parse_bool(val, app.cfg.privacy_check) {
+                Some(v) => { app.cfg.privacy_check = v; app.set_status(format!("privacy checks = {} (:r to apply)", v), Color::Cyan); }
+                None => app.set_status("privacy: on | off | toggle", Color::Red),
+            }
+        }
+        "dnssec" => {
+            match parse_bool(val, app.cfg.dnssec_check) {
+                Some(v) => { app.cfg.dnssec_check = v; app.set_status(format!("dnssec check = {} (:r to apply)", v), Color::Cyan); }
+                None => app.set_status("dnssec: on | off | toggle", Color::Red),
+            }
+        }
+        "alladdrs" | "all_addrs" | "addrs" => {
+            match parse_bool(val, app.cfg.all_addrs) {
+                Some(v) => { app.cfg.all_addrs = v; app.set_status(format!("all addresses = {} (:r to apply)", v), Color::Cyan); }
+                None => app.set_status("alladdrs: on | off | toggle", Color::Red),
+            }
+        }
+        "wildcard" => {
+            if val.is_empty() || val.eq_ignore_ascii_case("off") {
+                app.cfg.wildcard_domain = None;
+                app.set_status("uncached: random subdomains of each domain (:r to apply)", Color::Cyan);
+            } else {
+                app.cfg.wildcard_domain = Some(val.to_string());
+                app.set_status(format!("uncached: <random>.{} (:r to apply)", val), Color::Cyan);
+            }
+        }
         "transport" | "transports" => {
             if val.eq_ignore_ascii_case("all") || val.is_empty() {
                 app.cfg.transports.clear();
@@ -618,7 +767,7 @@ fn write_export(app: &mut App, arg: Option<&str>) {
         return;
     };
     let reports: Vec<EndpointReport> = app.endpoints.iter().map(|e| e.to_report()).collect();
-    match export(&reports, &path, fmt) {
+    match export(&reports, &app.cfg, &path, fmt) {
         Ok(()) => {
             app.export_path = Some(path.clone());
             app.set_status(format!("exported {} rows to {}", reports.len(), path.display()), Color::Green);
@@ -631,7 +780,7 @@ fn maybe_export(app: &App, path: &Option<PathBuf>) {
     let Some(path) = path else { return; };
     let Some(fmt) = ExportFormat::from_path(path) else { return; };
     let reports: Vec<EndpointReport> = app.endpoints.iter().map(|e| e.to_report()).collect();
-    let _ = export(&reports, path, fmt);
+    let _ = export(&reports, &app.cfg, path, fmt);
 }
 
 // --- drawing ---
@@ -652,7 +801,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     draw_status_line(f, chunks[2], app);
     draw_footer(f, chunks[3], app);
 
-    if matches!(app.mode, Mode::Help) { draw_help_overlay(f, app); }
+    match app.mode {
+        Mode::Help => draw_help_overlay(f, app),
+        Mode::Verdict => draw_verdict_overlay(f, app),
+        _ => {}
+    }
 }
 
 fn draw_header(f: &mut Frame, area: Rect, app: &App) {
@@ -683,15 +836,16 @@ fn draw_status_line(f: &mut Frame, area: Rect, app: &App) {
     };
     let stack = if cfg.include_ipv6 { "v4+v6" } else { "v4" };
     let transports = if cfg.transports.is_empty() {
-        "udp+dot+doh".to_string()
+        "all".to_string()
     } else {
         cfg.transports.iter().map(|k| k.label().to_ascii_lowercase()).collect::<Vec<_>>().join("+")
     };
     let summary = format!(
-        "  iter:{} sp:{}ms to:{}ms {} {} t:{} domains:{}",
+        "  iter:{} sp:{}ms to:{}ms cc:{} {} {} t:{} domains:{}",
         cfg.iterations,
         cfg.inter_query.as_millis(),
         cfg.timeout.as_millis(),
+        cfg.max_concurrent,
         classes, stack, transports, cfg.domains.len(),
     );
 
@@ -739,6 +893,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
                     Span::styled("[Enter]", Style::default().fg(Color::Cyan)), Span::raw(" detail  "),
                     Span::styled("[s]", Style::default().fg(Color::Cyan)), Span::raw(" sort  "),
                     Span::styled("[r]", Style::default().fg(Color::Cyan)), Span::raw(" restart  "),
+                    Span::styled("[v]", Style::default().fg(Color::Cyan)), Span::raw(" verdict  "),
                     Span::styled("[?]", Style::default().fg(Color::Cyan)), Span::raw(" help  "),
                     Span::styled("[q]", Style::default().fg(Color::Cyan)), Span::raw(" quit"),
                 ])
@@ -752,48 +907,79 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
+    let bold = Style::default().add_modifier(Modifier::BOLD);
     let mut header_cells = vec![
-        Cell::from("resolver").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("t").style(Style::default().add_modifier(Modifier::BOLD)),
-        Cell::from("addr").style(Style::default().add_modifier(Modifier::BOLD)),
+        Cell::from("resolver").style(bold),
+        Cell::from("t").style(bold),
+        Cell::from("addr").style(bold),
+        Cell::from("filter").style(bold),
+        Cell::from("sec").style(bold),
+        Cell::from("ecs").style(bold),
+        Cell::from(" setup").style(bold),
     ];
     let mut widths: Vec<Constraint> = vec![
         Constraint::Length(22),
+        Constraint::Length(4),
+        Constraint::Length(30),
+        Constraint::Length(9),
         Constraint::Length(3),
-        Constraint::Length(32),
+        Constraint::Length(3),
+        Constraint::Length(7),
     ];
     if app.cfg.cached {
-        for h in ["c_p50", "c_p95", "c_p99", "c_rel"] {
+        for h in [" c_p50", " c_p90", " c_p99", "c_rel"] {
             header_cells.push(Cell::from(h).style(Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)));
-            widths.push(Constraint::Length(8));
+            widths.push(Constraint::Length(7));
         }
     }
     if app.cfg.uncached {
-        for h in ["u_p50", "u_p95", "u_p99", "u_rel"] {
+        for h in [" u_p50", " u_p90", " u_p99", "u_rel"] {
             header_cells.push(Cell::from(h).style(Style::default().fg(Color::LightMagenta).add_modifier(Modifier::BOLD)));
-            widths.push(Constraint::Length(8));
+            widths.push(Constraint::Length(7));
         }
     }
-    header_cells.push(Cell::from("progress").style(Style::default().add_modifier(Modifier::BOLD)));
+    header_cells.push(Cell::from("progress").style(bold));
     widths.push(Constraint::Min(16));
 
+    let dim = Style::default().fg(Color::DarkGray);
     let mut rows: Vec<Row> = Vec::new();
     for &i in &app.last_sorted {
         let e = &app.endpoints[i];
         let tcolor = transport_color(e.transport_kind);
+        let dnssec = match e.dnssec {
+            Some(true) => Cell::from("yes").style(Style::default().fg(Color::Green)),
+            Some(false) => Cell::from("no").style(Style::default().fg(Color::Yellow)),
+            None => Cell::from("?").style(dim),
+        };
+        // Sending a client subnet is the privacy-unfriendly outcome.
+        let ecs = match e.privacy.as_ref().and_then(|p| p.ecs_sent) {
+            Some(true) => Cell::from("yes").style(Style::default().fg(Color::Yellow)),
+            Some(false) => Cell::from("no").style(Style::default().fg(Color::Green)),
+            None => Cell::from("?").style(dim),
+        };
+        let setup = match e.setup {
+            Some(Some(d)) => Cell::from(fmt_ms(d)),
+            Some(None) => Cell::from("  fail").style(Style::default().fg(Color::Red)),
+            None => Cell::from("     —").style(dim),
+        };
         let mut cells = vec![
             Cell::from(truncate(&e.name, 22)),
             Cell::from(e.transport_kind.label()).style(Style::default().fg(tcolor).add_modifier(Modifier::BOLD)),
-            Cell::from(truncate(&e.addr_display, 32)),
+            Cell::from(truncate(&e.addr_display, 30)),
+            Cell::from(truncate(e.filtering.as_deref().unwrap_or("-"), 9)).style(dim),
+            dnssec,
+            ecs,
+            setup,
         ];
         if app.cfg.cached {
-            push_summary_cells(&mut cells, e.cached_summary(), Color::LightGreen);
+            push_summary_cells(&mut cells, &e.cached_sum, Color::LightGreen);
         }
         if app.cfg.uncached {
-            push_summary_cells(&mut cells, e.uncached_summary(), Color::LightMagenta);
+            push_summary_cells(&mut cells, &e.uncached_sum, Color::LightMagenta);
         }
         let (d, t) = e.progress(app.cfg.cached, app.cfg.uncached);
-        cells.push(Cell::from(progress_bar(d, t, e.done)));
+        let progress = if e.running || e.done { progress_bar(d, t, e.done) } else { "queued".to_string() };
+        cells.push(Cell::from(progress));
         rows.push(Row::new(cells));
     }
 
@@ -805,29 +991,27 @@ fn draw_table(f: &mut Frame, area: Rect, app: &mut App) {
 
     let table = Table::new(rows, widths)
         .header(Row::new(header_cells).bottom_margin(1))
-        .block(Block::default().borders(Borders::ALL).title(format!(" results — sorted by {} ", app.sort.label())))
+        .block(Block::default().borders(Borders::ALL).title(format!(" results (ms) — sorted by {} ", app.sort.label())))
         .column_spacing(1)
-        .highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
+        .row_highlight_style(Style::default().bg(Color::DarkGray).add_modifier(Modifier::BOLD))
         .highlight_symbol("> ");
     f.render_stateful_widget(table, area, &mut app.table_state);
 }
 
-fn push_summary_cells(cells: &mut Vec<Cell>, s: Option<Summary>, color: Color) {
-    match s {
-        Some(s) => {
-            cells.push(Cell::from(fmt_ms(s.p50)).style(Style::default().fg(color)));
-            cells.push(Cell::from(fmt_ms(s.p95)));
-            cells.push(Cell::from(fmt_ms(s.p99)));
-            let rel = s.reliability();
-            let style = if rel < 0.80 { Style::default().fg(Color::Red) }
-                else if rel < 0.98 { Style::default().fg(Color::Yellow) }
-                else { Style::default().fg(Color::Green) };
-            cells.push(Cell::from(format!("{:>4.0}%", rel * 100.0)).style(style));
-        }
-        None => for _ in 0..4 {
-            cells.push(Cell::from("—").style(Style::default().fg(Color::DarkGray)));
-        },
-    }
+fn push_summary_cells(cells: &mut Vec<Cell>, s: &Option<Summary>, color: Color) {
+    let [p50, p90, p99, rel] = class_cells(s);
+    let dim = Style::default().fg(Color::DarkGray);
+    let has_samples = s.as_ref().is_some_and(|s| s.has_samples());
+    cells.push(Cell::from(format!("{:>6}", p50)).style(if has_samples { Style::default().fg(color) } else { dim }));
+    cells.push(Cell::from(format!("{:>6}", p90)));
+    cells.push(Cell::from(format!("{:>6}", p99)));
+    let rel_style = match s {
+        Some(s) if s.reliability() < 0.80 => Style::default().fg(Color::Red),
+        Some(s) if s.reliability() < 0.98 => Style::default().fg(Color::Yellow),
+        Some(_) => Style::default().fg(Color::Green),
+        None => dim,
+    };
+    cells.push(Cell::from(format!("{:>5}", rel)).style(rel_style));
 }
 
 fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
@@ -840,11 +1024,17 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
 
     let inner = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(6), Constraint::Min(5), Constraint::Length(3)])
+        .constraints([Constraint::Length(8), Constraint::Min(5), Constraint::Length(3)])
         .split(area);
 
-    let cached = ep.cached_summary();
-    let uncached = ep.uncached_summary();
+    let cached = ep.cached_sum.clone();
+    let uncached = ep.uncached_sum.clone();
+    let setup = match ep.setup {
+        Some(Some(d)) => format!("{:.1}ms", d.as_secs_f64() * 1000.0),
+        Some(None) => "failed".to_string(),
+        None if ep.transport_kind.is_connection_oriented() => "pending".to_string(),
+        None => "n/a (no connection)".to_string(),
+    };
     let tcolor = transport_color(ep.transport_kind);
     let summary_lines = vec![
         Line::from(vec![
@@ -852,6 +1042,19 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
             Span::styled(format!("({}) ", ep.provider), Style::default().fg(Color::DarkGray)),
             Span::styled(format!("{} ", ep.transport_kind.label()), Style::default().fg(tcolor).add_modifier(Modifier::BOLD)),
             Span::raw(ep.addr_display.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled("info    ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(
+                " filtering: {}   dnssec validation: {}   connection setup: {}",
+                ep.filtering.as_deref().unwrap_or("none"),
+                dnssec_label(ep.dnssec),
+                setup,
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("privacy ", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(privacy_line(&ep.privacy)),
         ]),
         class_line("cached", &cached, Color::LightGreen),
         class_line("uncached", &uncached, Color::LightMagenta),
@@ -899,6 +1102,8 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
         Span::styled(format!("{} network", f_counts.network), Style::default().fg(if f_counts.network > 0 { Color::Red } else { Color::DarkGray })),
         Span::raw("  "),
         Span::styled(format!("{} protocol", f_counts.protocol), Style::default().fg(if f_counts.protocol > 0 { Color::Red } else { Color::DarkGray })),
+        Span::raw("  "),
+        Span::styled(format!("{} bad answer", f_counts.bad_answer), Style::default().fg(if f_counts.bad_answer > 0 { Color::Red } else { Color::DarkGray })),
     ]);
     f.render_widget(
         Paragraph::new(err_line).block(Block::default().borders(Borders::ALL).title(" errors ")),
@@ -906,26 +1111,51 @@ fn draw_detail(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn privacy_line(p: &Option<PrivacyInfo>) -> String {
+    let Some(p) = p else { return " not checked".to_string() };
+    let exit = match (&p.exit_ip, &p.exit_as) {
+        (Some(ip), Some(asn)) => format!("{} ({})", ip, asn),
+        (Some(ip), None) => ip.to_string(),
+        _ => "unknown".to_string(),
+    };
+    let ecs = match (&p.ecs_sent, &p.ecs_subnet) {
+        (Some(true), Some(subnet)) => format!("yes ({})", subnet),
+        _ => ecs_label(&Some(p.clone())).to_string(),
+    };
+    format!(" exit server: {}   client subnet sent: {}", exit, ecs)
+}
+
 fn class_line(label: &str, s: &Option<Summary>, color: Color) -> Line<'static> {
+    let head = Span::styled(format!("{:<8}", label), Style::default().fg(color).add_modifier(Modifier::BOLD));
+    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
     match s {
+        Some(s) if s.has_samples() => {
+            let p99 = match s.p99_if_meaningful() {
+                Some(d) => format!("{:>6.1}ms", ms(d)),
+                None => "     n/a".to_string(),
+            };
+            Line::from(vec![
+                head,
+                Span::raw(format!(
+                    " p50 {:>6.1}ms  p90 {:>6.1}ms  p95 {:>6.1}ms  p99 {}  min {:>6.1}ms  max {:>6.1}ms  stddev {:>5.1}ms  rel {:>3.0}%  ({}/{})",
+                    ms(s.p50), ms(s.p90), ms(s.p95), p99, ms(s.min), ms(s.max),
+                    ms(s.stddev), s.reliability() * 100.0, s.successes, s.total,
+                )),
+            ])
+        }
         Some(s) => Line::from(vec![
-            Span::styled(format!("{:<8}", label), Style::default().fg(color).add_modifier(Modifier::BOLD)),
-            Span::raw(format!(
-                " p50 {:>6.1}ms  p95 {:>6.1}ms  p99 {:>6.1}ms  min {:>6.1}ms  max {:>6.1}ms  stddev {:>5.1}ms  rel {:>3.0}%  ({}/{})",
-                s.p50.as_secs_f64() * 1000.0, s.p95.as_secs_f64() * 1000.0, s.p99.as_secs_f64() * 1000.0,
-                s.min.as_secs_f64() * 1000.0, s.max.as_secs_f64() * 1000.0,
-                s.stddev.as_secs_f64() * 1000.0, s.reliability() * 100.0, s.successes, s.total,
-            )),
+            head,
+            Span::styled(format!(" no successful answers (0/{})", s.total), Style::default().fg(Color::Red)),
         ]),
         None => Line::from(vec![
-            Span::styled(format!("{:<8}", label), Style::default().fg(color).add_modifier(Modifier::BOLD)),
+            head,
             Span::styled(" no data yet", Style::default().fg(Color::DarkGray)),
         ]),
     }
 }
 
 fn draw_help_overlay(f: &mut Frame, _app: &App) {
-    let area = centered_rect(72, 80, f.area());
+    let area = centered_rect(76, 90, f.area());
     f.render_widget(Clear, area);
 
     let text = vec![
@@ -936,6 +1166,7 @@ fn draw_help_overlay(f: &mut Frame, _app: &App) {
         Line::from("  Enter     open / close detail pane"),
         Line::from("  s         cycle sort column"),
         Line::from("  r         restart benchmark with current config"),
+        Line::from("  v         verdict: the fastest resolver per category"),
         Line::from("  ↑/↓       move selection"),
         Line::from("  PgUp/Dn   move 10 rows"),
         Line::from("  ?         this help"),
@@ -952,7 +1183,13 @@ fn draw_help_overlay(f: &mut Frame, _app: &App) {
         Line::from("  :set to <ms>               per-query timeout"),
         Line::from("  :set preset <q|s|t|e>      quick | standard | thorough | exhaustive"),
         Line::from("  :set ipv6 on|off|toggle    include IPv6 endpoints"),
-        Line::from("  :set transports <list>     udp | dot | doh | all (comma-separated)"),
+        Line::from("  :set transports <list>     udp | dot | doh | doh3 | doq | all (comma-separated)"),
+        Line::from("  :set cc <N>                endpoints probed at once (0 = no limit)"),
+        Line::from("  :set alladdrs on|off       probe every address of a resolver"),
+        Line::from("  :set warmup on|off         untimed query per domain before cached"),
+        Line::from("  :set dnssec on|off         DNSSEC validation check"),
+        Line::from("  :set privacy on|off        exit-server and client-subnet checks"),
+        Line::from("  :set wildcard <domain|off> uncached = <random>.<domain>, expects an address"),
         Line::from("  :set cached on|off         include cached class (alias :cached)"),
         Line::from("  :set uncached on|off       include uncached class (alias :uncached)"),
         Line::from("  :add <domain> [..]         add domains to probe set"),
@@ -967,6 +1204,43 @@ fn draw_help_overlay(f: &mut Frame, _app: &App) {
     let p = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .block(Block::default().borders(Borders::ALL).title(" help "));
+    f.render_widget(p, area);
+}
+
+fn draw_verdict_overlay(f: &mut Frame, app: &App) {
+    let area = centered_rect(90, 60, f.area());
+    f.render_widget(Clear, area);
+
+    let reports: Vec<EndpointReport> = app.endpoints.iter().map(|e| e.to_report()).collect();
+    let v = verdict(&reports, &app.system);
+
+    let mut text = vec![
+        Line::from(Span::styled(
+            if app.finished { "Verdict" } else { "Verdict so far (benchmark still running)" },
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+    ];
+    for line in v.lines() {
+        let style = if line.starts_with("note:") {
+            Style::default().fg(Color::Yellow)
+        } else if line.starts_with("Your resolver") {
+            Style::default().fg(Color::LightGreen)
+        } else {
+            Style::default()
+        };
+        text.push(Line::from(Span::styled(line, style)));
+    }
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled(
+        "Ranked by 75% cached + 25% uncached median. Endpoints under 97% reliability are left out.",
+        Style::default().fg(Color::DarkGray),
+    )));
+    text.push(Line::from(Span::styled("Esc to close", Style::default().fg(Color::Yellow))));
+
+    let p = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .block(Block::default().borders(Borders::ALL).title(" verdict "));
     f.render_widget(p, area);
 }
 
@@ -1005,6 +1279,8 @@ fn transport_color(k: TransportKind) -> Color {
         TransportKind::Udp => Color::White,
         TransportKind::Dot => Color::LightBlue,
         TransportKind::Doh => Color::LightYellow,
+        TransportKind::Doh3 => Color::LightRed,
+        TransportKind::Doq => Color::LightCyan,
     }
 }
 
@@ -1018,12 +1294,4 @@ fn progress_bar(done: usize, total: usize, finished: bool) -> String {
     s.push_str(&"░".repeat(width - filled));
     if finished { s.push_str(" done"); } else { s.push_str(&format!(" {}/{}", done, total)); }
     s
-}
-
-fn truncate(s: &str, n: usize) -> String {
-    if s.chars().count() <= n { s.to_string() }
-    else {
-        let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
-        out.push_str(".."); out
-    }
 }
